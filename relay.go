@@ -34,6 +34,7 @@ var (
 	device = flag.String("device", "default", "implementation of ble")
 
 	scanDuration = flag.Duration("sd", 5*time.Second, "scanning duration, 0 for indefinitely")
+	// loopInterval = flag.Duration("loop", 0, "loop interval duration in seconds, 0 for no loop (run once and exit)")
 
 	deviceSettingsFile = flag.String("device-settings", "devices.ini", "device settings file")
 
@@ -42,16 +43,15 @@ var (
 	mqttClientId = flag.String("mqtt-client-id", "atc-sensor-relay", "MQTT client ID")
 )
 
-func isAtcDevice(a ble.Advertisement) bool {
-	// check if the device's name matches the ATC regex
-	atcRegex := regexp.MustCompile(atcDeviceRegex)
-	return atcRegex.MatchString(a.LocalName())
-}
-
 // sensor settings structure
 type sensorInfo struct {
 	sensorName string
 	mqttTopic  string
+}
+
+type topicWithPayload struct {
+	topic   string
+	payload interface{}
 }
 
 func loadKnownSensors(settingsFilePath string) map[string]sensorInfo {
@@ -109,6 +109,8 @@ func loadKnownSensors(settingsFilePath string) map[string]sensorInfo {
 
 func main() {
 
+	flag.Parse()
+
 	// read known sensor mapping
 	knownSensors := loadKnownSensors(*deviceSettingsFile)
 	fmt.Printf("Known sensors: %v\n", knownSensors)
@@ -117,8 +119,6 @@ func main() {
 		fmt.Printf("no known sensors, exiting...\n")
 		return
 	}
-
-	flag.Parse()
 
 	d, err := dev.NewDevice(*device)
 	if err != nil {
@@ -165,22 +165,21 @@ func main() {
 	numConnections := len(foundDevices)
 	fmt.Printf("starting loop for %d devices\n", numConnections)
 
-	// topic -> payload
-	payloads := make(map[string]interface{})
+	topicPayloads := make([]topicWithPayload, 0, numConnections)
 	for deviceName, info := range foundDevices {
 		payload, err := getDeviceData(deviceName, info)
 		if err == nil {
 			fmt.Printf("got: %v\n", payload)
 			topic := knownSensors[deviceName].mqttTopic
-			payloads[topic] = payload
+			topicPayloads = append(topicPayloads, topicWithPayload{topic, payload})
 		} else {
 			fmt.Printf("Error polling device %s: %s\n", deviceName, err)
 		}
 	}
 
-	fmt.Printf("got %d payloads\n", len(payloads))
+	fmt.Printf("got %d payloads\n", len(topicPayloads))
 
-	if len(payloads) > 0 {
+	if len(topicPayloads) > 0 {
 		var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
 			fmt.Printf("[MQTT] Received message: %s from topic: %s\n", msg.Payload(), msg.Topic())
 		}
@@ -205,8 +204,8 @@ func main() {
 			panic(token.Error())
 		}
 
-		for topic, payload := range payloads {
-			jsonPayload, err := json.Marshal(payload)
+		for _, topicWithPayload := range topicPayloads {
+			jsonPayload, err := json.Marshal(topicWithPayload.payload)
 			if err != nil {
 				log.Fatalf("[MQTT] can't marshal payload: %s", err)
 			}
@@ -214,7 +213,7 @@ func main() {
 			fmt.Printf("[MQTT] Sending payload: %s\n", jsonPayload)
 
 			// Publish the JSON payload to a topic
-			token := client.Publish(topic, 0, false, jsonPayload)
+			token := client.Publish(topicWithPayload.topic, 0, false, jsonPayload)
 			token.Wait()
 		}
 
